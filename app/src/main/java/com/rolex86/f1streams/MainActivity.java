@@ -48,13 +48,13 @@ public class MainActivity extends Activity {
     private static final String CHANNELS = "https://cdn.f1live.dpdns.org/channels.json";
     private static final String ORIGIN = "https://f1live.dpdns.org";
     private static final String[] GROUPS = {"Server 1", "Server 2", "Other Sports"};
-
     private static final String CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final List<StreamItem> items = new ArrayList<>();
     private final List<StreamItem> collected = new ArrayList<>();
     private final Set<String> collectedKeys = new HashSet<>();
+    private final StreamProxy proxy = new StreamProxy();
 
     private ArrayAdapter<StreamItem> adapter;
     private ListView list;
@@ -81,8 +81,6 @@ public class MainActivity extends Activity {
         FrameLayout screen = new FrameLayout(this);
         screen.setBackgroundColor(Color.BLACK);
 
-        // WebView has a full-size viewport behind the visible UI, so the website
-        // behaves normally but does not take any space away from the stream list.
         web = new WebView(this);
         web.setAlpha(0f);
         web.setFocusable(false);
@@ -109,14 +107,8 @@ public class MainActivity extends Activity {
             @Override
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 String url = request.getUrl().toString();
-
-                if (url.startsWith(CHANNELS)) {
-                    return proxyChannels();
-                }
-
-                if (capturingMedia && isMedia(url)) {
-                    mediaFound(url, request.getRequestHeaders());
-                }
+                if (url.startsWith(CHANNELS)) return proxyChannels();
+                if (capturingMedia && isMedia(url)) mediaFound(url, request.getRequestHeaders());
                 return null;
             }
 
@@ -196,7 +188,6 @@ public class MainActivity extends Activity {
         screen.addView(root, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
-
         setContentView(screen);
     }
 
@@ -219,38 +210,27 @@ public class MainActivity extends Activity {
             c.setRequestProperty("Sec-CH-UA", "\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"");
             c.setRequestProperty("Sec-CH-UA-Mobile", "?0");
             c.setRequestProperty("Sec-CH-UA-Platform", "\"Windows\"");
-
             String cookies = CookieManager.getInstance().getCookie(CHANNELS);
             if (cookies != null && !cookies.isEmpty()) c.setRequestProperty("Cookie", cookies);
-
             int code = c.getResponseCode();
             InputStream in = code >= 200 && code < 400 ? c.getInputStream() : c.getErrorStream();
             byte[] body = readAll(in);
             channelProxyInfo = "kanály: HTTP " + code + ", " + body.length + " B";
-
             Map<String, String> headers = new HashMap<>();
             headers.put("Access-Control-Allow-Origin", ORIGIN);
             headers.put("Access-Control-Expose-Headers", "ETag");
             headers.put("Cache-Control", "no-store");
             headers.put("Content-Type", "application/json");
-
             String reason = code >= 200 && code < 300 ? "OK" : "HTTP error";
-            return new WebResourceResponse(
-                    "application/json",
-                    "UTF-8",
-                    code,
-                    reason,
-                    headers,
+            return new WebResourceResponse("application/json", "UTF-8", code, reason, headers,
                     new ByteArrayInputStream(body));
         } catch (Exception e) {
-            channelProxyInfo = "kanály: chyba " + e.getClass().getSimpleName() +
-                    (e.getMessage() == null ? "" : " (" + e.getMessage() + ")");
+            channelProxyInfo = "kanály: chyba " + e.getClass().getSimpleName();
             byte[] body = "[]".getBytes(java.nio.charset.StandardCharsets.UTF_8);
             Map<String, String> headers = new HashMap<>();
             headers.put("Access-Control-Allow-Origin", ORIGIN);
             headers.put("Content-Type", "application/json");
-            return new WebResourceResponse(
-                    "application/json", "UTF-8", 200, "OK", headers,
+            return new WebResourceResponse("application/json", "UTF-8", 200, "OK", headers,
                     new ByteArrayInputStream(body));
         } finally {
             if (c != null) c.disconnect();
@@ -297,12 +277,7 @@ public class MainActivity extends Activity {
 
     private void scrapeNames(String group, int token, int retry) {
         if (!collecting || token != collectionToken) return;
-        String js = "(function(){" +
-                "var a=[],all=[].slice.call(document.querySelectorAll('body *'));" +
-                "all.forEach(function(e){var t=(e.innerText||'').trim();if(!t||t.length>240||!/(^|\\n)online($|\\n)/i.test(t))return;" +
-                "var l=t.split(/\\n+/).map(function(x){return x.trim();}).filter(Boolean).filter(function(x){return !/^online$/i.test(x)&&!/may contain ads/i.test(x);});" +
-                "if(l.length&&l[0].length<120)a.push({n:l[0],z:t.length});});" +
-                "a.sort(function(x,y){return x.z-y.z;});var o=[],s={};a.forEach(function(x){if(!s[x.n]){s[x.n]=1;o.push(x.n);}});return JSON.stringify(o);})()";
+        String js = "(function(){var a=[],all=[].slice.call(document.querySelectorAll('body *'));all.forEach(function(e){var t=(e.innerText||'').trim();if(!t||t.length>240||!/(^|\\n)online($|\\n)/i.test(t))return;var l=t.split(/\\n+/).map(function(x){return x.trim();}).filter(Boolean).filter(function(x){return !/^online$/i.test(x)&&!/may contain ads/i.test(x);});if(l.length&&l[0].length<120)a.push({n:l[0],z:t.length});});a.sort(function(x,y){return x.z-y.z;});var o=[],s={};a.forEach(function(x){if(!s[x.n]){s[x.n]=1;o.push(x.n);}});return JSON.stringify(o);})()";
         web.evaluateJavascript(js, value -> {
             List<String> names = decodeStringArray(value);
             if (names.isEmpty() && retry < 5) {
@@ -315,11 +290,8 @@ public class MainActivity extends Activity {
                 if (collectedKeys.add(key)) collected.add(new StreamItem(group, name, false));
             }
             providerIndex++;
-            if (providerIndex < GROUPS.length) {
-                handler.postDelayed(() -> collectProvider(token, 0), 400);
-            } else {
-                finishCollection(token);
-            }
+            if (providerIndex < GROUPS.length) handler.postDelayed(() -> collectProvider(token, 0), 400);
+            else finishCollection(token);
         });
     }
 
@@ -330,17 +302,14 @@ public class MainActivity extends Activity {
         items.addAll(collected);
         items.add(StreamItem.refresh());
         adapter.notifyDataSetChanged();
-        status.setText(collected.isEmpty()
-                ? "Žádné streamy. " + channelProxyInfo
-                : "Dostupné streamy: " + collected.size() + " (" + channelProxyInfo + ")");
+        status.setText(collected.isEmpty() ? "Žádné streamy. " + channelProxyInfo :
+                "Dostupné streamy: " + collected.size() + " (" + channelProxyInfo + ")");
         list.requestFocus();
     }
 
     private void clickText(String text, BoolCallback callback) {
         String q = JSONObject.quote(text);
-        String js = "(function(){var q=" + q + ",a=[].slice.call(document.querySelectorAll('body *')).filter(function(e){return (e.innerText||'').trim()===q;});" +
-                "a.sort(function(x,y){return (x.innerText||'').length-(y.innerText||'').length;});if(!a.length)return false;" +
-                "var e=a[0];while(e&&e.tagName!='BUTTON')e=e.parentElement;(e||a[0]).click();return true;})()";
+        String js = "(function(){var q=" + q + ",a=[].slice.call(document.querySelectorAll('body *')).filter(function(e){return (e.innerText||'').trim()===q;});a.sort(function(x,y){return (x.innerText||'').length-(y.innerText||'').length;});if(!a.length)return false;var e=a[0];while(e&&e.tagName!='BUTTON')e=e.parentElement;(e||a[0]).click();return true;})()";
         web.evaluateJavascript(js, value -> callback.done("true".equalsIgnoreCase(value)));
     }
 
@@ -381,10 +350,7 @@ public class MainActivity extends Activity {
 
     private void clickChannel(String name, BoolCallback callback) {
         String q = JSONObject.quote(name);
-        String js = "(function(){var q=" + q + ",a=[].slice.call(document.querySelectorAll('body *')).filter(function(e){var t=(e.innerText||'').trim();if(!t||t.length>240)return false;" +
-                "var l=t.split(/\\n+/).map(function(x){return x.trim();}).filter(Boolean);return l.length&&l[0]===q;});" +
-                "a.sort(function(x,y){return (x.innerText||'').length-(y.innerText||'').length;});if(!a.length)return false;" +
-                "var e=a[0];while(e&&e.tagName!='BUTTON')e=e.parentElement;(e||a[0]).click();return true;})()";
+        String js = "(function(){var q=" + q + ",a=[].slice.call(document.querySelectorAll('body *')).filter(function(e){var t=(e.innerText||'').trim();if(!t||t.length>240)return false;var l=t.split(/\\n+/).map(function(x){return x.trim();}).filter(Boolean);return l.length&&l[0]===q;});a.sort(function(x,y){return (x.innerText||'').length-(y.innerText||'').length;});if(!a.length)return false;var e=a[0];while(e&&e.tagName!='BUTTON')e=e.parentElement;(e||a[0]).click();return true;})()";
         web.evaluateJavascript(js, value -> callback.done("true".equalsIgnoreCase(value)));
     }
 
@@ -399,37 +365,24 @@ public class MainActivity extends Activity {
             playbackToken++;
             String referer = requestHeaders == null ? null : requestHeaders.get("Referer");
             if (referer == null || referer.isEmpty()) referer = PAGE;
-            launchPlayer(url, referer, requestHeaders, item == null ? "F1 Stream" : item.name);
+            launchPlayerViaProxy(url, referer, requestHeaders, item == null ? "F1 Stream" : item.name);
         });
     }
 
-    private void launchPlayer(String url, String referer, Map<String, String> requestHeaders, String title) {
-        Intent i = new Intent(Intent.ACTION_VIEW);
-        i.setDataAndType(Uri.parse(url), "video/*");
-        i.addCategory(Intent.CATEGORY_DEFAULT);
-        i.putExtra(Intent.EXTRA_REFERRER, Uri.parse(referer));
-        i.putExtra("title", title);
-        i.putExtra("referer", referer);
-        i.putExtra("referrer", referer);
-
-        Bundle headers = new Bundle();
-        headers.putString("Referer", referer);
-        headers.putString("User-Agent", CHROME_UA);
-        String cookies = CookieManager.getInstance().getCookie(url);
-        if (cookies != null && !cookies.isEmpty()) headers.putString("Cookie", cookies);
-        if (requestHeaders != null) {
-            for (Map.Entry<String, String> e : requestHeaders.entrySet()) {
-                if (e.getKey() != null && e.getValue() != null) headers.putString(e.getKey(), e.getValue());
-            }
-        }
-        i.putExtra("headers", headers);
-        i.putExtra("http_headers", headers);
-
+    private void launchPlayerViaProxy(String sourceUrl, String referer,
+                                      Map<String, String> requestHeaders, String title) {
         try {
+            String localUrl = proxy.start(sourceUrl, referer, requestHeaders, CHROME_UA);
+            Intent i = new Intent(Intent.ACTION_VIEW);
+            i.setDataAndType(Uri.parse(localUrl), "video/*");
+            i.addCategory(Intent.CATEGORY_DEFAULT);
+            i.putExtra("title", title);
             startActivity(i);
-            status.setText("Předáno přehrávači.");
+            status.setText("Předáno přehrávači přes lokální proxy.");
         } catch (ActivityNotFoundException e) {
             Toast.makeText(this, "Není nainstalovaný vhodný přehrávač.", Toast.LENGTH_LONG).show();
+        } catch (Exception e) {
+            status.setText("Proxy chyba: " + e.getClass().getSimpleName());
         }
     }
 
@@ -444,8 +397,7 @@ public class MainActivity extends Activity {
                 String s = a.optString(x, "").trim();
                 if (!s.isEmpty()) out.add(s);
             }
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
         return out;
     }
 
@@ -465,6 +417,7 @@ public class MainActivity extends Activity {
         playbackToken++;
         capturingMedia = false;
         handler.removeCallbacksAndMessages(null);
+        proxy.stop();
         if (web != null) {
             web.stopLoading();
             web.destroy();
@@ -485,13 +438,9 @@ public class MainActivity extends Activity {
             this.refresh = refresh;
         }
 
-        static StreamItem refresh() {
-            return new StreamItem("", "↻ Obnovit", true);
-        }
+        static StreamItem refresh() { return new StreamItem("", "↻ Obnovit", true); }
 
         @Override
-        public String toString() {
-            return refresh ? name : group + " • " + name;
-        }
+        public String toString() { return refresh ? name : group + " • " + name; }
     }
 }
