@@ -54,6 +54,7 @@ public class MainActivity extends Activity {
     private final List<StreamItem> items = new ArrayList<>();
     private final List<StreamItem> collected = new ArrayList<>();
     private final Set<String> collectedKeys = new HashSet<>();
+    private final Set<String> rejectedMedia = new HashSet<>();
     private final StreamProxy proxy = new StreamProxy();
 
     private ArrayAdapter<StreamItem> adapter;
@@ -66,6 +67,7 @@ public class MainActivity extends Activity {
     private int providerIndex;
     private StreamItem pendingPlayback;
     private volatile boolean capturingMedia;
+    private volatile boolean validatingMedia;
     private int playbackToken;
     private volatile String channelProxyInfo = "kanály: požadavek zatím nepřišel";
 
@@ -98,7 +100,8 @@ public class MainActivity extends Activity {
 
         web.setWebChromeClient(new WebChromeClient() {
             @Override
-            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, android.os.Message resultMsg) {
+            public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture,
+                                          android.os.Message resultMsg) {
                 return false;
             }
         });
@@ -108,23 +111,23 @@ public class MainActivity extends Activity {
             public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 String url = request.getUrl().toString();
                 if (url.startsWith(CHANNELS)) return proxyChannels();
-                if (capturingMedia && isMedia(url)) mediaFound(url, request.getRequestHeaders());
+
+                if (capturingMedia && isHls(url)) {
+                    submitMediaCandidate(url, request.getRequestHeaders());
+                    // Important: do not let the hidden WebView consume the same HLS URL.
+                    return emptyMediaResponse();
+                }
                 return null;
             }
 
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 String url = request.getUrl().toString();
-                if (capturingMedia && isMedia(url)) {
-                    mediaFound(url, request.getRequestHeaders());
+                if (capturingMedia && isHls(url)) {
+                    submitMediaCandidate(url, request.getRequestHeaders());
                     return true;
                 }
                 return false;
-            }
-
-            @Override
-            public void onLoadResource(WebView view, String url) {
-                if (capturingMedia && isMedia(url)) mediaFound(url, null);
             }
 
             @Override
@@ -132,7 +135,9 @@ public class MainActivity extends Activity {
                 if (pendingPlayback != null && url.startsWith(ORIGIN + "/")) {
                     int token = playbackToken;
                     handler.postDelayed(() -> {
-                        if (token == playbackToken && pendingPlayback != null) selectForPlayback(pendingPlayback);
+                        if (token == playbackToken && pendingPlayback != null) {
+                            selectForPlayback(pendingPlayback);
+                        }
                     }, 1200);
                 } else if (collecting && url.startsWith(ORIGIN + "/")) {
                     int token = collectionToken;
@@ -189,6 +194,13 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(screen);
+    }
+
+    private WebResourceResponse emptyMediaResponse() {
+        return new WebResourceResponse(
+                "application/vnd.apple.mpegurl",
+                "UTF-8",
+                new ByteArrayInputStream(new byte[0]));
     }
 
     private WebResourceResponse proxyChannels() {
@@ -255,6 +267,9 @@ public class MainActivity extends Activity {
     private void refresh() {
         pendingPlayback = null;
         capturingMedia = false;
+        validatingMedia = false;
+        rejectedMedia.clear();
+        proxy.stop();
         collecting = true;
         collectionToken++;
         providerIndex = 0;
@@ -272,7 +287,8 @@ public class MainActivity extends Activity {
     private void collectProvider(int token, int retry) {
         if (!collecting || token != collectionToken || providerIndex >= GROUPS.length) return;
         final String group = GROUPS[providerIndex];
-        clickText(group, clicked -> handler.postDelayed(() -> scrapeNames(group, token, retry), clicked ? 800 : 300));
+        clickText(group, clicked -> handler.postDelayed(
+                () -> scrapeNames(group, token, retry), clicked ? 800 : 300));
     }
 
     private void scrapeNames(String group, int token, int retry) {
@@ -290,8 +306,11 @@ public class MainActivity extends Activity {
                 if (collectedKeys.add(key)) collected.add(new StreamItem(group, name, false));
             }
             providerIndex++;
-            if (providerIndex < GROUPS.length) handler.postDelayed(() -> collectProvider(token, 0), 400);
-            else finishCollection(token);
+            if (providerIndex < GROUPS.length) {
+                handler.postDelayed(() -> collectProvider(token, 0), 400);
+            } else {
+                finishCollection(token);
+            }
         });
     }
 
@@ -318,6 +337,9 @@ public class MainActivity extends Activity {
         collectionToken++;
         pendingPlayback = item;
         capturingMedia = false;
+        validatingMedia = false;
+        rejectedMedia.clear();
+        proxy.stop();
         playbackToken++;
         status.setText("Připravuji: " + item.name);
         web.stopLoading();
@@ -336,14 +358,17 @@ public class MainActivity extends Activity {
                     return;
                 }
                 capturingMedia = true;
-                status.setText("Hledám skutečný stream: " + item.name);
+                validatingMedia = false;
+                rejectedMedia.clear();
+                status.setText("Hledám live HLS: " + item.name);
                 handler.postDelayed(() -> {
                     if (token == playbackToken && capturingMedia) {
                         capturingMedia = false;
+                        validatingMedia = false;
                         pendingPlayback = null;
-                        status.setText("Stream se nepodařilo zachytit. Zkus jiný zdroj.");
+                        status.setText("Nenašel jsem použitelný live stream. Zkus jiný zdroj.");
                     }
-                }, 18_000);
+                }, 20_000);
             });
         }, ok ? 800 : 300));
     }
@@ -354,36 +379,89 @@ public class MainActivity extends Activity {
         web.evaluateJavascript(js, value -> callback.done("true".equalsIgnoreCase(value)));
     }
 
-    private void mediaFound(String url, Map<String, String> requestHeaders) {
-        synchronized (this) {
-            if (!capturingMedia) return;
-            capturingMedia = false;
+    private void submitMediaCandidate(String url, Map<String, String> requestHeaders) {
+        if (!capturingMedia || !isHls(url)) return;
+
+        synchronized (rejectedMedia) {
+            if (validatingMedia || rejectedMedia.contains(url)) return;
+            validatingMedia = true;
         }
-        runOnUiThread(() -> {
-            StreamItem item = pendingPlayback;
-            pendingPlayback = null;
-            playbackToken++;
-            String referer = requestHeaders == null ? null : requestHeaders.get("Referer");
-            if (referer == null || referer.isEmpty()) referer = PAGE;
-            launchPlayerViaProxy(url, referer, requestHeaders, item == null ? "F1 Stream" : item.name);
-        });
+
+        int token = playbackToken;
+        StreamItem item = pendingPlayback;
+        String referer = header(requestHeaders, "Referer");
+        if (referer == null || referer.isEmpty()) referer = PAGE;
+        final String finalReferer = referer;
+        final Map<String, String> headers = requestHeaders == null
+                ? new HashMap<>() : new HashMap<>(requestHeaders);
+
+        runOnUiThread(() -> status.setText("Ověřuji live stream: "
+                + (item == null ? "F1" : item.name)));
+
+        new Thread(() -> {
+            try {
+                String localUrl = proxy.startValidated(url, finalReferer, headers, CHROME_UA);
+                runOnUiThread(() -> {
+                    if (token != playbackToken || !capturingMedia || pendingPlayback == null) {
+                        proxy.stop();
+                        return;
+                    }
+                    capturingMedia = false;
+                    validatingMedia = false;
+                    StreamItem selected = pendingPlayback;
+                    pendingPlayback = null;
+                    playbackToken++;
+                    web.stopLoading();
+                    launchExternalPlayer(localUrl,
+                            selected == null ? "F1 Stream" : selected.name);
+                });
+            } catch (Exception e) {
+                synchronized (rejectedMedia) {
+                    rejectedMedia.add(url);
+                    validatingMedia = false;
+                }
+                runOnUiThread(() -> {
+                    if (token == playbackToken && capturingMedia) {
+                        String reason = proxy.validationError();
+                        status.setText("Kandidát odmítnut"
+                                + (reason.isEmpty() ? "" : ": " + reason)
+                                + " — hledám další…");
+                    }
+                });
+            }
+        }, "f1-hls-validate").start();
     }
 
-    private void launchPlayerViaProxy(String sourceUrl, String referer,
-                                      Map<String, String> requestHeaders, String title) {
+    private void launchExternalPlayer(String localUrl, String title) {
         try {
-            String localUrl = proxy.start(sourceUrl, referer, requestHeaders, CHROME_UA);
             Intent i = new Intent(Intent.ACTION_VIEW);
-            i.setDataAndType(Uri.parse(localUrl), "video/*");
+            i.setDataAndType(Uri.parse(localUrl), "application/vnd.apple.mpegurl");
             i.addCategory(Intent.CATEGORY_DEFAULT);
             i.putExtra("title", title);
             startActivity(i);
-            status.setText("Předáno přehrávači přes lokální proxy.");
+            status.setText("Předáno přehrávači.");
         } catch (ActivityNotFoundException e) {
-            Toast.makeText(this, "Není nainstalovaný vhodný přehrávač.", Toast.LENGTH_LONG).show();
-        } catch (Exception e) {
-            status.setText("Proxy chyba: " + e.getClass().getSimpleName());
+            // Some players only advertise video/*, so retry once with the generic video MIME.
+            try {
+                Intent i = new Intent(Intent.ACTION_VIEW);
+                i.setDataAndType(Uri.parse(localUrl), "video/*");
+                i.addCategory(Intent.CATEGORY_DEFAULT);
+                startActivity(i);
+                status.setText("Předáno přehrávači.");
+            } catch (ActivityNotFoundException e2) {
+                proxy.stop();
+                Toast.makeText(this, "Není nainstalovaný vhodný přehrávač.",
+                        Toast.LENGTH_LONG).show();
+            }
         }
+    }
+
+    private String header(Map<String, String> headers, String name) {
+        if (headers == null) return null;
+        for (Map.Entry<String, String> e : headers.entrySet()) {
+            if (e.getKey() != null && e.getKey().equalsIgnoreCase(name)) return e.getValue();
+        }
+        return null;
     }
 
     private List<String> decodeStringArray(String value) {
@@ -401,10 +479,10 @@ public class MainActivity extends Activity {
         return out;
     }
 
-    private static boolean isMedia(String url) {
+    private static boolean isHls(String url) {
         if (url == null) return false;
         String u = url.toLowerCase(Locale.ROOT);
-        return u.startsWith("http") && (u.contains(".m3u8") || u.contains(".mpd"));
+        return u.startsWith("http") && u.contains(".m3u8");
     }
 
     private int dp(int v) {
@@ -416,6 +494,7 @@ public class MainActivity extends Activity {
         collectionToken++;
         playbackToken++;
         capturingMedia = false;
+        validatingMedia = false;
         handler.removeCallbacksAndMessages(null);
         proxy.stop();
         if (web != null) {
@@ -438,9 +517,13 @@ public class MainActivity extends Activity {
             this.refresh = refresh;
         }
 
-        static StreamItem refresh() { return new StreamItem("", "↻ Obnovit", true); }
+        static StreamItem refresh() {
+            return new StreamItem("", "↻ Obnovit", true);
+        }
 
         @Override
-        public String toString() { return refresh ? name : group + " • " + name; }
+        public String toString() {
+            return refresh ? name : group + " • " + name;
+        }
     }
 }
