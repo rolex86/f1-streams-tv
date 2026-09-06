@@ -34,13 +34,20 @@ final class StreamProxy {
     private String userAgent;
     private Map<String, String> sourceHeaders = Collections.emptyMap();
 
+    private String initialSourceUrl;
+    private String initialBaseUrl;
+    private String initialPlaylist;
+    private boolean initialPlaylistServed;
+
     private volatile int requestCount;
     private volatile int lastStatus;
     private volatile String lastPath = "-";
     private volatile String lastError = "";
+    private volatile String validationError = "";
 
-    synchronized String start(String sourceUrl, String referer,
-                              Map<String, String> requestHeaders, String userAgent) throws Exception {
+    synchronized String startValidated(String sourceUrl, String referer,
+                                       Map<String, String> requestHeaders,
+                                       String userAgent) throws Exception {
         stop();
         this.referer = referer;
         this.userAgent = userAgent;
@@ -51,6 +58,21 @@ final class StreamProxy {
         lastStatus = 0;
         lastPath = "-";
         lastError = "";
+        validationError = "";
+        initialSourceUrl = null;
+        initialBaseUrl = null;
+        initialPlaylist = null;
+        initialPlaylistServed = false;
+
+        Probe probe = probePlaylist(sourceUrl);
+        if (!probe.valid) {
+            validationError = probe.error;
+            throw new IllegalArgumentException(probe.error);
+        }
+
+        initialSourceUrl = sourceUrl;
+        initialBaseUrl = probe.finalUrl;
+        initialPlaylist = probe.playlist;
 
         server = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"));
         port = server.getLocalPort();
@@ -59,7 +81,9 @@ final class StreamProxy {
         acceptThread = new Thread(this::acceptLoop, "f1-stream-proxy");
         acceptThread.setDaemon(true);
         acceptThread.start();
-        return localUrl(sourceUrl);
+
+        // Force an HLS-looking root path so external players can infer the media type.
+        return localUrl(sourceUrl, true);
     }
 
     synchronized void stop() {
@@ -69,13 +93,62 @@ final class StreamProxy {
             server = null;
         }
         acceptThread = null;
+        initialSourceUrl = null;
+        initialBaseUrl = null;
+        initialPlaylist = null;
+        initialPlaylistServed = false;
     }
 
     String diagnostic() {
-        if (requestCount == 0) return "Proxy: přehrávač se k proxy nepřipojil";
-        String base = "Proxy: " + requestCount + " požadavků, poslední HTTP " + lastStatus + " " + lastPath;
+        if (requestCount == 0) {
+            if (validationError != null && !validationError.isEmpty()) {
+                return "Proxy: " + validationError;
+            }
+            return "Proxy: přehrávač se k proxy nepřipojil";
+        }
+        String base = "Proxy: " + requestCount + " požadavků, poslední HTTP "
+                + lastStatus + " " + lastPath;
         if (lastError != null && !lastError.isEmpty()) base += " | " + lastError;
         return base;
+    }
+
+    String validationError() {
+        return validationError == null ? "" : validationError;
+    }
+
+    private Probe probePlaylist(String sourceUrl) {
+        HttpURLConnection c = null;
+        try {
+            c = openUpstream(sourceUrl, null, false);
+            int code = c.getResponseCode();
+            if (code < 200 || code >= 300) {
+                return Probe.fail("HLS HTTP " + code);
+            }
+
+            byte[] raw = readAllLimited(c.getInputStream(), 1024 * 1024);
+            String text = new String(raw, StandardCharsets.UTF_8).trim();
+            if (!text.startsWith("#EXTM3U")) {
+                return Probe.fail("není HLS playlist");
+            }
+
+            boolean master = text.contains("#EXT-X-STREAM-INF") || text.contains("#EXT-X-MEDIA");
+            boolean media = text.contains("#EXTINF") || text.contains("#EXT-X-TARGETDURATION");
+            if (!master && !media) {
+                return Probe.fail("HLS bez streamů");
+            }
+
+            // A finite media playlist is usually an advert/clip rather than the live channel.
+            if (!master && text.contains("#EXT-X-ENDLIST")) {
+                return Probe.fail("krátký/VOD HLS, čekám na live stream");
+            }
+
+            return Probe.ok(text, c.getURL().toString());
+        } catch (Exception e) {
+            return Probe.fail(e.getClass().getSimpleName()
+                    + (e.getMessage() == null ? "" : ": " + e.getMessage()));
+        } finally {
+            if (c != null) c.disconnect();
+        }
     }
 
     private void acceptLoop() {
@@ -104,6 +177,7 @@ final class StreamProxy {
                 sendSimple(s.getOutputStream(), 400, "Bad Request", "text/plain", new byte[0]);
                 return;
             }
+
             String method = parts[0];
             boolean headOnly = "HEAD".equals(method);
             if (!"GET".equals(method) && !headOnly) {
@@ -131,29 +205,32 @@ final class StreamProxy {
             lastPath = shortPath(target);
             lastError = "";
 
-            upstream = (HttpURLConnection) new URL(target).openConnection();
-            upstream.setConnectTimeout(12_000);
-            upstream.setReadTimeout(20_000);
-            upstream.setInstanceFollowRedirects(true);
-            if (headOnly) upstream.setRequestMethod("HEAD");
-
-            for (Map.Entry<String, String> e : sourceHeaders.entrySet()) {
-                String key = e.getKey();
-                String value = e.getValue();
-                if (key == null || value == null || blockedHeader(key)) continue;
-                try { upstream.setRequestProperty(key, value); } catch (Exception ignored) {}
+            // Serve the already validated first playlist once. This avoids consuming a
+            // short-lived/single-use URL during validation and then requesting it again.
+            if (!headOnly && target.equals(initialSourceUrl) && !initialPlaylistServed
+                    && initialPlaylist != null) {
+                initialPlaylistServed = true;
+                lastStatus = 200;
+                String rewritten = rewritePlaylist(initialPlaylist,
+                        initialBaseUrl == null ? target : initialBaseUrl);
+                byte[] out = rewritten.getBytes(StandardCharsets.UTF_8);
+                sendSimple(s.getOutputStream(), 200, "OK",
+                        "application/vnd.apple.mpegurl", out);
+                return;
             }
 
-            upstream.setRequestProperty("Accept-Encoding", "identity");
-            upstream.setRequestProperty("User-Agent", valueOr(sourceHeaders, "User-Agent", userAgent));
-            upstream.setRequestProperty("Referer", valueOr(sourceHeaders, "Referer", referer));
+            if (headOnly && target.equals(initialSourceUrl) && initialPlaylist != null) {
+                lastStatus = 200;
+                OutputStream out = s.getOutputStream();
+                writeStatus(out, 200, "OK");
+                writeHeader(out, "Content-Type", "application/vnd.apple.mpegurl");
+                writeHeader(out, "Connection", "close");
+                out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+                out.flush();
+                return;
+            }
 
-            String cookies = CookieManager.getInstance().getCookie(target);
-            if (cookies != null && !cookies.isEmpty()) upstream.setRequestProperty("Cookie", cookies);
-
-            String range = clientHeaders.get("range");
-            if (range != null && !range.isEmpty()) upstream.setRequestProperty("Range", range);
-
+            upstream = openUpstream(target, clientHeaders.get("range"), headOnly);
             int code = upstream.getResponseCode();
             lastStatus = code;
             String type = upstream.getContentType();
@@ -163,12 +240,7 @@ final class StreamProxy {
                 OutputStream out = s.getOutputStream();
                 writeStatus(out, code, reason(code));
                 writeHeader(out, "Content-Type", type);
-                String contentRange = upstream.getHeaderField("Content-Range");
-                if (contentRange != null) writeHeader(out, "Content-Range", contentRange);
-                String acceptRanges = upstream.getHeaderField("Accept-Ranges");
-                if (acceptRanges != null) writeHeader(out, "Accept-Ranges", acceptRanges);
-                long length = upstream.getContentLengthLong();
-                if (length >= 0) writeHeader(out, "Content-Length", Long.toString(length));
+                copyRangeHeaders(upstream, out);
                 writeHeader(out, "Connection", "close");
                 out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
                 out.flush();
@@ -179,11 +251,10 @@ final class StreamProxy {
                     ? upstream.getInputStream()
                     : upstream.getErrorStream();
 
-            boolean hls = isHls(target, type);
-            if (hls) {
-                byte[] raw = readAll(body);
+            if (isHls(target, type)) {
+                byte[] raw = readAllLimited(body, 2 * 1024 * 1024);
                 String text = new String(raw, StandardCharsets.UTF_8);
-                String rewritten = rewritePlaylist(text, target);
+                String rewritten = rewritePlaylist(text, upstream.getURL().toString());
                 byte[] out = rewritten.getBytes(StandardCharsets.UTF_8);
                 sendSimple(s.getOutputStream(), code, reason(code),
                         "application/vnd.apple.mpegurl", out);
@@ -191,14 +262,8 @@ final class StreamProxy {
                 OutputStream out = s.getOutputStream();
                 writeStatus(out, code, reason(code));
                 writeHeader(out, "Content-Type", type);
+                copyRangeHeaders(upstream, out);
                 writeHeader(out, "Connection", "close");
-
-                String contentRange = upstream.getHeaderField("Content-Range");
-                if (contentRange != null) writeHeader(out, "Content-Range", contentRange);
-                String acceptRanges = upstream.getHeaderField("Accept-Ranges");
-                if (acceptRanges != null) writeHeader(out, "Accept-Ranges", acceptRanges);
-                long length = upstream.getContentLengthLong();
-                if (length >= 0) writeHeader(out, "Content-Length", Long.toString(length));
                 out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
 
                 if (body != null) {
@@ -220,6 +285,40 @@ final class StreamProxy {
         }
     }
 
+    private HttpURLConnection openUpstream(String target, String range, boolean headOnly)
+            throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(target).openConnection();
+        c.setConnectTimeout(12_000);
+        c.setReadTimeout(20_000);
+        c.setInstanceFollowRedirects(true);
+        if (headOnly) c.setRequestMethod("HEAD");
+
+        for (Map.Entry<String, String> e : sourceHeaders.entrySet()) {
+            String key = e.getKey();
+            String value = e.getValue();
+            if (key == null || value == null || blockedHeader(key)) continue;
+            try { c.setRequestProperty(key, value); } catch (Exception ignored) {}
+        }
+
+        c.setRequestProperty("Accept-Encoding", "identity");
+        c.setRequestProperty("User-Agent", valueOr(sourceHeaders, "User-Agent", userAgent));
+        c.setRequestProperty("Referer", valueOr(sourceHeaders, "Referer", referer));
+
+        String cookies = CookieManager.getInstance().getCookie(target);
+        if (cookies != null && !cookies.isEmpty()) c.setRequestProperty("Cookie", cookies);
+        if (range != null && !range.isEmpty()) c.setRequestProperty("Range", range);
+        return c;
+    }
+
+    private void copyRangeHeaders(HttpURLConnection upstream, OutputStream out) throws Exception {
+        String contentRange = upstream.getHeaderField("Content-Range");
+        if (contentRange != null) writeHeader(out, "Content-Range", contentRange);
+        String acceptRanges = upstream.getHeaderField("Accept-Ranges");
+        if (acceptRanges != null) writeHeader(out, "Accept-Ranges", acceptRanges);
+        long length = upstream.getContentLengthLong();
+        if (length >= 0) writeHeader(out, "Content-Length", Long.toString(length));
+    }
+
     private boolean blockedHeader(String key) {
         String k = key.toLowerCase(Locale.ROOT);
         return k.equals("host") || k.equals("connection") || k.equals("cookie") ||
@@ -237,14 +336,15 @@ final class StreamProxy {
                 StringBuffer sb = new StringBuffer();
                 while (m.find()) {
                     String absolute = resolve(base, m.group(1));
-                    String replacement = absolute == null ? m.group(1) : localUrl(absolute);
-                    m.appendReplacement(sb, Matcher.quoteReplacement("URI=\"" + replacement + "\""));
+                    String replacement = absolute == null ? m.group(1) : localUrl(absolute, false);
+                    m.appendReplacement(sb, Matcher.quoteReplacement(
+                            "URI=\"" + replacement + "\""));
                 }
                 m.appendTail(sb);
                 out.append(sb);
             } else if (!line.trim().isEmpty()) {
                 String absolute = resolve(base, line.trim());
-                out.append(absolute == null ? line : localUrl(absolute));
+                out.append(absolute == null ? line : localUrl(absolute, false));
             } else {
                 out.append(line);
             }
@@ -263,10 +363,11 @@ final class StreamProxy {
         }
     }
 
-    private String localUrl(String target) {
+    private String localUrl(String target, boolean forceHls) {
         String encoded = Base64.encodeToString(target.getBytes(StandardCharsets.UTF_8),
                 Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING);
-        return "http://127.0.0.1:" + port + pathHint(target) + "?u=" + encoded;
+        String path = forceHls ? "/stream.m3u8" : pathHint(target);
+        return "http://127.0.0.1:" + port + path + "?u=" + encoded;
     }
 
     private String decodeTarget(String requestTarget) {
@@ -294,7 +395,7 @@ final class StreamProxy {
             String name = slash >= 0 ? path.substring(slash + 1) : path;
             if (name.matches("[A-Za-z0-9._-]{1,80}")) return "/" + name;
         } catch (Exception ignored) {}
-        return "/stream";
+        return "/stream.bin";
     }
 
     private String shortPath(String target) {
@@ -325,12 +426,17 @@ final class StreamProxy {
         return "application/octet-stream";
     }
 
-    private byte[] readAll(InputStream in) throws Exception {
+    private byte[] readAllLimited(InputStream in, int maxBytes) throws Exception {
         if (in == null) return new byte[0];
         try (InputStream input = in; ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[8192];
+            int total = 0;
             int n;
-            while ((n = input.read(buffer)) != -1) out.write(buffer, 0, n);
+            while ((n = input.read(buffer)) != -1) {
+                total += n;
+                if (total > maxBytes) throw new IllegalArgumentException("playlist je příliš velký");
+                out.write(buffer, 0, n);
+            }
             return out.toByteArray();
         }
     }
@@ -379,6 +485,28 @@ final class StreamProxy {
             case 403: return "Forbidden";
             case 404: return "Not Found";
             default: return code >= 200 && code < 300 ? "OK" : "Upstream";
+        }
+    }
+
+    private static final class Probe {
+        final boolean valid;
+        final String playlist;
+        final String finalUrl;
+        final String error;
+
+        private Probe(boolean valid, String playlist, String finalUrl, String error) {
+            this.valid = valid;
+            this.playlist = playlist;
+            this.finalUrl = finalUrl;
+            this.error = error;
+        }
+
+        static Probe ok(String playlist, String finalUrl) {
+            return new Probe(true, playlist, finalUrl, "");
+        }
+
+        static Probe fail(String error) {
+            return new Probe(false, null, null, error);
         }
     }
 }
