@@ -8,15 +8,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Inspect current channel data
-        run: |
-          curl -fsSL \
-            -A 'Mozilla/5.0' \
-            -H 'Origin: https://f1live.dpdns.org' \
-            -H 'Referer: https://f1live.dpdns.org/stream' \
-            https://cdn.f1live.dpdns.org/channels.json | tee /tmp/channels.json
-          echo '--- channels.json ---'
-          cat /tmp/channels.json
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
