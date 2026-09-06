@@ -34,6 +34,11 @@ final class StreamProxy {
     private String userAgent;
     private Map<String, String> sourceHeaders = Collections.emptyMap();
 
+    private volatile int requestCount;
+    private volatile int lastStatus;
+    private volatile String lastPath = "-";
+    private volatile String lastError = "";
+
     synchronized String start(String sourceUrl, String referer,
                               Map<String, String> requestHeaders, String userAgent) throws Exception {
         stop();
@@ -42,6 +47,10 @@ final class StreamProxy {
         this.sourceHeaders = requestHeaders == null
                 ? Collections.emptyMap()
                 : new HashMap<>(requestHeaders);
+        requestCount = 0;
+        lastStatus = 0;
+        lastPath = "-";
+        lastError = "";
 
         server = new ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"));
         port = server.getLocalPort();
@@ -62,6 +71,13 @@ final class StreamProxy {
         acceptThread = null;
     }
 
+    String diagnostic() {
+        if (requestCount == 0) return "Proxy: přehrávač se k proxy nepřipojil";
+        String base = "Proxy: " + requestCount + " požadavků, poslední HTTP " + lastStatus + " " + lastPath;
+        if (lastError != null && !lastError.isEmpty()) base += " | " + lastError;
+        return base;
+    }
+
     private void acceptLoop() {
         while (running) {
             try {
@@ -69,10 +85,7 @@ final class StreamProxy {
                 Thread t = new Thread(() -> handle(socket), "f1-proxy-client");
                 t.setDaemon(true);
                 t.start();
-            } catch (Exception e) {
-                if (running) {
-                    // Next accept will retry unless the server was stopped.
-                }
+            } catch (Exception ignored) {
             }
         }
     }
@@ -108,21 +121,26 @@ final class StreamProxy {
                 return;
             }
 
+            requestCount++;
+            lastPath = shortPath(target);
+            lastError = "";
+
             upstream = (HttpURLConnection) new URL(target).openConnection();
             upstream.setConnectTimeout(12_000);
             upstream.setReadTimeout(20_000);
             upstream.setInstanceFollowRedirects(true);
+
+            // Reuse as much of the accepted WebView request as possible.
+            for (Map.Entry<String, String> e : sourceHeaders.entrySet()) {
+                String key = e.getKey();
+                String value = e.getValue();
+                if (key == null || value == null || blockedHeader(key)) continue;
+                try { upstream.setRequestProperty(key, value); } catch (Exception ignored) {}
+            }
+
             upstream.setRequestProperty("Accept-Encoding", "identity");
             upstream.setRequestProperty("User-Agent", valueOr(sourceHeaders, "User-Agent", userAgent));
             upstream.setRequestProperty("Referer", valueOr(sourceHeaders, "Referer", referer));
-
-            String origin = header(sourceHeaders, "Origin");
-            if (origin != null && !origin.isEmpty()) upstream.setRequestProperty("Origin", origin);
-
-            String authorization = header(sourceHeaders, "Authorization");
-            if (authorization != null && !authorization.isEmpty()) {
-                upstream.setRequestProperty("Authorization", authorization);
-            }
 
             String cookies = CookieManager.getInstance().getCookie(target);
             if (cookies != null && !cookies.isEmpty()) upstream.setRequestProperty("Cookie", cookies);
@@ -131,6 +149,7 @@ final class StreamProxy {
             if (range != null && !range.isEmpty()) upstream.setRequestProperty("Range", range);
 
             int code = upstream.getResponseCode();
+            lastStatus = code;
             InputStream body = code >= 200 && code < 400
                     ? upstream.getInputStream()
                     : upstream.getErrorStream();
@@ -162,21 +181,26 @@ final class StreamProxy {
                 if (body != null) {
                     byte[] buffer = new byte[32 * 1024];
                     int n;
-                    while ((n = body.read(buffer)) != -1) {
-                        out.write(buffer, 0, n);
-                    }
+                    while ((n = body.read(buffer)) != -1) out.write(buffer, 0, n);
                 }
                 out.flush();
             }
         } catch (Exception e) {
+            lastStatus = 502;
+            lastError = e.getClass().getSimpleName() + ": " + String.valueOf(e.getMessage());
             try {
                 sendSimple(socket.getOutputStream(), 502, "Bad Gateway", "text/plain",
-                        (e.getClass().getSimpleName() + ": " + String.valueOf(e.getMessage()))
-                                .getBytes(StandardCharsets.UTF_8));
+                        lastError.getBytes(StandardCharsets.UTF_8));
             } catch (Exception ignored) {}
         } finally {
             if (upstream != null) upstream.disconnect();
         }
+    }
+
+    private boolean blockedHeader(String key) {
+        String k = key.toLowerCase(Locale.ROOT);
+        return k.equals("host") || k.equals("connection") || k.equals("cookie") ||
+                k.equals("content-length") || k.equals("accept-encoding") || k.equals("range");
     }
 
     private String rewritePlaylist(String playlist, String sourceUrl) throws Exception {
@@ -248,6 +272,17 @@ final class StreamProxy {
             if (name.matches("[A-Za-z0-9._-]{1,80}")) return "/" + name;
         } catch (Exception ignored) {}
         return "/stream";
+    }
+
+    private String shortPath(String target) {
+        try {
+            URL u = new URL(target);
+            String p = u.getPath();
+            if (p.length() > 55) p = "…" + p.substring(p.length() - 54);
+            return u.getHost() + p;
+        } catch (Exception e) {
+            return target.length() > 65 ? target.substring(0, 65) : target;
+        }
     }
 
     private boolean isHls(String target, String type) {
