@@ -100,7 +100,13 @@ final class StreamProxy {
             if (requestLine == null || requestLine.isEmpty()) return;
 
             String[] parts = requestLine.split(" ");
-            if (parts.length < 2 || !"GET".equals(parts[0])) {
+            if (parts.length < 2) {
+                sendSimple(s.getOutputStream(), 400, "Bad Request", "text/plain", new byte[0]);
+                return;
+            }
+            String method = parts[0];
+            boolean headOnly = "HEAD".equals(method);
+            if (!"GET".equals(method) && !headOnly) {
                 sendSimple(s.getOutputStream(), 405, "Method Not Allowed", "text/plain", new byte[0]);
                 return;
             }
@@ -129,8 +135,8 @@ final class StreamProxy {
             upstream.setConnectTimeout(12_000);
             upstream.setReadTimeout(20_000);
             upstream.setInstanceFollowRedirects(true);
+            if (headOnly) upstream.setRequestMethod("HEAD");
 
-            // Reuse as much of the accepted WebView request as possible.
             for (Map.Entry<String, String> e : sourceHeaders.entrySet()) {
                 String key = e.getKey();
                 String value = e.getValue();
@@ -150,11 +156,28 @@ final class StreamProxy {
 
             int code = upstream.getResponseCode();
             lastStatus = code;
+            String type = upstream.getContentType();
+            if (type == null) type = guessType(target);
+
+            if (headOnly) {
+                OutputStream out = s.getOutputStream();
+                writeStatus(out, code, reason(code));
+                writeHeader(out, "Content-Type", type);
+                String contentRange = upstream.getHeaderField("Content-Range");
+                if (contentRange != null) writeHeader(out, "Content-Range", contentRange);
+                String acceptRanges = upstream.getHeaderField("Accept-Ranges");
+                if (acceptRanges != null) writeHeader(out, "Accept-Ranges", acceptRanges);
+                long length = upstream.getContentLengthLong();
+                if (length >= 0) writeHeader(out, "Content-Length", Long.toString(length));
+                writeHeader(out, "Connection", "close");
+                out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+                out.flush();
+                return;
+            }
+
             InputStream body = code >= 200 && code < 400
                     ? upstream.getInputStream()
                     : upstream.getErrorStream();
-            String type = upstream.getContentType();
-            if (type == null) type = guessType(target);
 
             boolean hls = isHls(target, type);
             if (hls) {
