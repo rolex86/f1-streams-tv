@@ -21,6 +21,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.TextView;
@@ -48,7 +49,6 @@ public class MainActivity extends Activity {
     private static final String ORIGIN = "https://f1live.dpdns.org";
     private static final String[] GROUPS = {"Server 1", "Server 2", "Other Sports"};
 
-    // Header set observed from a real Chrome request accepted by the CDN.
     private static final String CHROME_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -78,46 +78,11 @@ public class MainActivity extends Activity {
 
     @SuppressLint("SetJavaScriptEnabled")
     private void buildUi() {
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setBackgroundColor(Color.BLACK);
-        root.setPadding(dp(28), dp(20), dp(28), dp(20));
+        FrameLayout screen = new FrameLayout(this);
+        screen.setBackgroundColor(Color.BLACK);
 
-        TextView title = new TextView(this);
-        title.setText("F1 Streams");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(28);
-        title.setPadding(0, 0, 0, dp(8));
-        root.addView(title, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        status = new TextView(this);
-        status.setTextColor(0xffaaaaaa);
-        status.setTextSize(15);
-        status.setPadding(0, 0, 0, dp(12));
-        root.addView(status, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        list = new ListView(this);
-        list.setDividerHeight(1);
-        adapter = new ArrayAdapter<StreamItem>(this, android.R.layout.simple_list_item_1, items) {
-            @Override
-            public View getView(int position, View convertView, ViewGroup parent) {
-                TextView v = (TextView) super.getView(position, convertView, parent);
-                v.setTextColor(Color.WHITE);
-                v.setTextSize(21);
-                v.setGravity(Gravity.CENTER_VERTICAL);
-                v.setMinHeight(dp(58));
-                v.setPadding(dp(18), 0, dp(18), 0);
-                v.setBackgroundResource(android.R.drawable.list_selector_background);
-                return v;
-            }
-        };
-        list.setAdapter(adapter);
-        list.setOnItemClickListener(this::onItemClick);
-        root.addView(list, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
-
+        // WebView has a full-size viewport behind the visible UI, so the website
+        // behaves normally but does not take any space away from the stream list.
         web = new WebView(this);
         web.setAlpha(0f);
         web.setFocusable(false);
@@ -184,13 +149,55 @@ public class MainActivity extends Activity {
             }
         });
 
-        // Keep a real viewport so the React page is not throttled as a tiny hidden document.
-        LinearLayout.LayoutParams hidden = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(360));
-        hidden.height = dp(360);
-        root.addView(web, hidden);
+        screen.addView(web, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
 
-        setContentView(root);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.BLACK);
+        root.setPadding(dp(28), dp(20), dp(28), dp(20));
+
+        TextView title = new TextView(this);
+        title.setText("F1 Streams");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(28);
+        title.setPadding(0, 0, 0, dp(8));
+        root.addView(title, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        status = new TextView(this);
+        status.setTextColor(0xffaaaaaa);
+        status.setTextSize(15);
+        status.setPadding(0, 0, 0, dp(12));
+        root.addView(status, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        list = new ListView(this);
+        list.setDividerHeight(1);
+        adapter = new ArrayAdapter<StreamItem>(this, android.R.layout.simple_list_item_1, items) {
+            @Override
+            public View getView(int position, View convertView, ViewGroup parent) {
+                TextView v = (TextView) super.getView(position, convertView, parent);
+                v.setTextColor(Color.WHITE);
+                v.setTextSize(21);
+                v.setGravity(Gravity.CENTER_VERTICAL);
+                v.setMinHeight(dp(58));
+                v.setPadding(dp(18), 0, dp(18), 0);
+                v.setBackgroundResource(android.R.drawable.list_selector_background);
+                return v;
+            }
+        };
+        list.setAdapter(adapter);
+        list.setOnItemClickListener(this::onItemClick);
+        root.addView(list, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
+
+        screen.addView(root, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+
+        setContentView(screen);
     }
 
     private WebResourceResponse proxyChannels() {
